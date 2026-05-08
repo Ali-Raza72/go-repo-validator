@@ -1,0 +1,230 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"time"
+)
+
+// RepoReport holds the full validation result
+type RepoReport struct {
+	RepoPath     string        `json:"repo_path"`
+	GeneratedAt  string        `json:"generated_at"`
+	GitInfo      GitInfo       `json:"git_info"`
+	DockerInfo   DockerInfo    `json:"docker_info"`
+	TestCoverage TestCoverage  `json:"test_coverage"`
+	Issues       []string      `json:"issues"`
+	Score        int           `json:"score"`
+}
+
+type GitInfo struct {
+	Branch        string   `json:"branch"`
+	TotalCommits  int      `json:"total_commits"`
+	Contributors  []string `json:"contributors"`
+	LastCommit    string   `json:"last_commit"`
+	HasGitIgnore  bool     `json:"has_gitignore"`
+	HasReadme     bool     `json:"has_readme"`
+}
+
+type DockerInfo struct {
+	HasDockerfile         bool `json:"has_dockerfile"`
+	HasDockerCompose      bool `json:"has_docker_compose"`
+	MultiStageDockerfile  bool `json:"multi_stage_dockerfile"`
+}
+
+type TestCoverage struct {
+	HasTests       bool     `json:"has_tests"`
+	TestFiles      []string `json:"test_files"`
+	TotalTestFiles int      `json:"total_test_files"`
+}
+
+func runCmd(dir, name string, args ...string) (string, error) {
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	return strings.TrimSpace(string(out)), err
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func analyzeGit(repoPath string) GitInfo {
+	info := GitInfo{}
+
+	branch, err := runCmd(repoPath, "git", "rev-parse", "--abbrev-ref", "HEAD")
+	if err == nil {
+		info.Branch = branch
+	}
+
+	commits, err := runCmd(repoPath, "git", "rev-list", "--count", "HEAD")
+	if err == nil {
+		fmt.Sscanf(commits, "%d", &info.TotalCommits)
+	}
+
+	log, err := runCmd(repoPath, "git", "log", "-1", "--format=%cd %s", "--date=short")
+	if err == nil {
+		info.LastCommit = log
+	}
+
+	shortlog, err := runCmd(repoPath, "git", "shortlog", "-sn", "--no-merges")
+	if err == nil {
+		for _, line := range strings.Split(shortlog, "\n") {
+			parts := strings.Fields(line)
+			if len(parts) >= 2 {
+				info.Contributors = append(info.Contributors, strings.Join(parts[1:], " "))
+			}
+		}
+	}
+
+	info.HasGitIgnore = fileExists(filepath.Join(repoPath, ".gitignore"))
+	info.HasReadme = fileExists(filepath.Join(repoPath, "README.md")) ||
+		fileExists(filepath.Join(repoPath, "README"))
+
+	return info
+}
+
+func analyzeDocker(repoPath string) DockerInfo {
+	info := DockerInfo{}
+	info.HasDockerfile = fileExists(filepath.Join(repoPath, "Dockerfile"))
+	info.HasDockerCompose = fileExists(filepath.Join(repoPath, "docker-compose.yml")) ||
+		fileExists(filepath.Join(repoPath, "docker-compose.yaml"))
+
+	if info.HasDockerfile {
+		data, err := os.ReadFile(filepath.Join(repoPath, "Dockerfile"))
+		if err == nil {
+			stageCount := strings.Count(string(data), "FROM ")
+			info.MultiStageDockerfile = stageCount > 1
+		}
+	}
+	return info
+}
+
+func analyzeTests(repoPath string) TestCoverage {
+	cov := TestCoverage{}
+	err := filepath.WalkDir(repoPath, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !d.IsDir() && strings.HasSuffix(d.Name(), "_test.go") {
+			rel, _ := filepath.Rel(repoPath, path)
+			cov.TestFiles = append(cov.TestFiles, rel)
+		}
+		return nil
+	})
+	if err == nil {
+		cov.TotalTestFiles = len(cov.TestFiles)
+		cov.HasTests = cov.TotalTestFiles > 0
+	}
+	return cov
+}
+
+func scoreRepo(report *RepoReport) {
+	score := 0
+	issues := []string{}
+
+	// Git checks
+	if report.GitInfo.HasReadme {
+		score += 20
+	} else {
+		issues = append(issues, "Missing README.md — add documentation")
+	}
+	if report.GitInfo.HasGitIgnore {
+		score += 10
+	} else {
+		issues = append(issues, "Missing .gitignore — add one to avoid committing build artifacts")
+	}
+	if report.GitInfo.TotalCommits > 5 {
+		score += 10
+	} else {
+		issues = append(issues, "Very few commits — consider more granular commit history")
+	}
+
+	// Docker checks
+	if report.DockerInfo.HasDockerfile {
+		score += 20
+		if report.DockerInfo.MultiStageDockerfile {
+			score += 10
+		}
+	} else {
+		issues = append(issues, "No Dockerfile found — consider containerizing the app")
+	}
+	if report.DockerInfo.HasDockerCompose {
+		score += 10
+	}
+
+	// Test checks
+	if report.TestCoverage.HasTests {
+		score += 20
+	} else {
+		issues = append(issues, "No Go test files found — add unit tests (_test.go)")
+	}
+
+	report.Score = score
+	report.Issues = issues
+}
+
+func main() {
+	repoPath := "."
+	if len(os.Args) > 1 {
+		repoPath = os.Args[1]
+	}
+
+	absPath, err := filepath.Abs(repoPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error resolving path: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("🔍 Validating repository: %s\n\n", absPath)
+
+	report := RepoReport{
+		RepoPath:    absPath,
+		GeneratedAt: time.Now().Format(time.RFC3339),
+	}
+
+	report.GitInfo = analyzeGit(absPath)
+	report.DockerInfo = analyzeDocker(absPath)
+	report.TestCoverage = analyzeTests(absPath)
+	scoreRepo(&report)
+
+	// Print summary
+	fmt.Println("=== GIT INFO ===")
+	fmt.Printf("  Branch       : %s\n", report.GitInfo.Branch)
+	fmt.Printf("  Commits      : %d\n", report.GitInfo.TotalCommits)
+	fmt.Printf("  Last Commit  : %s\n", report.GitInfo.LastCommit)
+	fmt.Printf("  README       : %v\n", report.GitInfo.HasReadme)
+	fmt.Printf("  .gitignore   : %v\n", report.GitInfo.HasGitIgnore)
+
+	fmt.Println("\n=== DOCKER INFO ===")
+	fmt.Printf("  Dockerfile        : %v\n", report.DockerInfo.HasDockerfile)
+	fmt.Printf("  Multi-stage build : %v\n", report.DockerInfo.MultiStageDockerfile)
+	fmt.Printf("  Docker Compose    : %v\n", report.DockerInfo.HasDockerCompose)
+
+	fmt.Println("\n=== TEST COVERAGE ===")
+	fmt.Printf("  Has Tests   : %v\n", report.TestCoverage.HasTests)
+	fmt.Printf("  Test Files  : %d\n", report.TestCoverage.TotalTestFiles)
+	for _, f := range report.TestCoverage.TestFiles {
+		fmt.Printf("    - %s\n", f)
+	}
+
+	fmt.Printf("\n=== SCORE: %d/100 ===\n", report.Score)
+	if len(report.Issues) > 0 {
+		fmt.Println("\n⚠️  Issues Found:")
+		for _, issue := range report.Issues {
+			fmt.Printf("  • %s\n", issue)
+		}
+	} else {
+		fmt.Println("✅ No issues found!")
+	}
+
+	// Also write JSON report
+	jsonOut, _ := json.MarshalIndent(report, "", "  ")
+	_ = os.WriteFile("repo-report.json", jsonOut, 0644)
+	fmt.Println("\n📄 Full report saved to repo-report.json")
+}
